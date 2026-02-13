@@ -94,3 +94,4 @@ Use the **sidebar**:
 - This repo is intended for **paper trading / research**; do your own due diligence before trading real money.
 - APIs and fee structures for Polymarket/Manifold may change; if things break, check their latest docs and update the platform clients accordingly.
 
+# arb-bot
