@@ -5,9 +5,17 @@ Run with: streamlit run dashboard.py
 import streamlit as st
 import json
 import time
+import asyncio
+import os
 from datetime import datetime, timezone
 from pathlib import Path
+from dotenv import load_dotenv
 from stats_writer import STATS_FILE, get_stats
+from platforms import PolymarketClient, ManifoldPlatformClient
+from matcher import match_events
+from arbitrage import find_arbitrage_opportunities
+
+load_dotenv()
 
 st.set_page_config(
     page_title="Arbitrage Scanner Dashboard",
@@ -49,6 +57,104 @@ def format_timestamp(iso_str: str) -> str:
     except:
         return iso_str
 
+@st.cache_data(ttl=60)  # Cache for 60 seconds
+def perform_live_scan():
+    """Perform a live scan when JSON file is not available (e.g., on Streamlit Cloud)."""
+    try:
+        # Initialize clients
+        pm_client = PolymarketClient(
+            private_key=os.getenv("POLYMARKET_PRIVATE_KEY"),
+            api_key=os.getenv("CLOB_API_KEY"),
+            api_secret=os.getenv("CLOB_SECRET"),
+            api_passphrase=os.getenv("CLOB_PASSPHRASE")
+        )
+        manifold_client = ManifoldPlatformClient(api_key=os.getenv("MANIFOLD_API_KEY"))
+        
+        # Fetch events
+        async def fetch_events():
+            pm_events = await pm_client.get_events(limit=50, max_resolution_days=3)
+            manifold_events = await manifold_client.get_events(limit=50, max_resolution_days=3)
+            return pm_events, manifold_events
+        
+        pm_events, manifold_events = asyncio.run(fetch_events())
+        
+        # Match events
+        matched_events = match_events(
+            polymarket_events=pm_events,
+            kalshi_events=manifold_events,
+            title_similarity_threshold=0.5,
+            date_tolerance_days=3
+        )
+        
+        # Find opportunities
+        opportunities = find_arbitrage_opportunities(
+            matched_events=matched_events,
+            polymarket_client=pm_client,
+            kalshi_client=manifold_client,
+            min_profit_pct=0.5,
+            order_size_usd=1.0
+        )
+        
+        # Format as stats structure
+        return {
+            'last_scan': {
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'pm_events': len(pm_events),
+                'manifold_events': len(manifold_events),
+                'matched': len(matched_events),
+                'opportunities_count': len(opportunities),
+                'opportunities': [
+                    {
+                        'title': opp.get('pm_event', {}).get('title', '')[:60],
+                        'direction': opp.get('direction', ''),
+                        'profit_pct': opp.get('profit_pct', 0),
+                        'profit': opp.get('profit', 0),
+                        'pm_yes': opp.get('pm_price', 0),
+                        'pm_no': opp.get('pm_event', {}).get('markets', [{}])[0].get('no_price', 0),
+                        'manifold_yes': opp.get('kalshi_event', {}).get('markets', [{}])[0].get('yes_price', 0),
+                        'manifold_no': opp.get('kalshi_price', 0),
+                    }
+                    for opp in opportunities
+                ],
+                'pm_sample': [
+                    {
+                        'title': e.get('title', '')[:60],
+                        'end_date': e.get('end_date').isoformat() if e.get('end_date') else None,
+                        'markets_count': len(e.get('markets', []))
+                    }
+                    for e in pm_events[:5]
+                ],
+                'manifold_sample': [
+                    {
+                        'title': e.get('title', '')[:60],
+                        'end_date': e.get('end_date').isoformat() if e.get('end_date') else None,
+                        'markets_count': len(e.get('markets', []))
+                    }
+                    for e in manifold_events[:5]
+                ],
+                'matched_details': [
+                    {
+                        'pm_title': pm.get('title', '')[:50],
+                        'manifold_title': mf.get('title', '')[:50],
+                    }
+                    for pm, mf in matched_events[:10]
+                ]
+            },
+            'total_scans': 1,
+            'total_opportunities': len(opportunities),
+            'total_alerts': 0,
+            'best_opportunity': {
+                'title': max(opportunities, key=lambda x: x.get('profit_pct', 0)).get('pm_event', {}).get('title', '')[:60],
+                'profit_pct': max(opportunities, key=lambda x: x.get('profit_pct', 0)).get('profit_pct', 0),
+                'profit': max(opportunities, key=lambda x: x.get('profit_pct', 0)).get('profit', 0),
+                'timestamp': datetime.now(timezone.utc).isoformat()
+            } if opportunities else None,
+            'scan_history': []
+        }
+    except Exception as e:
+        st.error(f"Error performing live scan: {e}")
+        return None
+
 def main():
     st.title("📊 Cross-Platform Arbitrage Scanner Dashboard")
     st.markdown("---")
@@ -82,13 +188,21 @@ def main():
         st.session_state.refresh_timer = time.time()
         st.rerun()
     
-    # Load stats
+    # Load stats - try JSON file first, then perform live scan
     stats = get_stats()
     
     if not stats:
-        st.warning("⚠️ No scan data available yet. Start the scanner to see statistics.")
-        st.info("Run: `python paper_trader.py` in another terminal")
-        return
+        # If no JSON file exists (e.g., on Streamlit Cloud), perform live scan
+        with st.spinner("🔄 Performing live scan..."):
+            stats = perform_live_scan()
+        
+        if not stats:
+            st.error("❌ Failed to fetch data. Please check your API keys in Streamlit secrets.")
+            st.info("💡 **Tip:** Make sure all required secrets are configured in Streamlit Cloud settings.")
+            return
+        
+        st.success("✅ Live scan completed!")
+        st.caption("💡 **Note:** This is a live scan. For continuous monitoring, run `paper_trader.py` locally.")
     
     last_scan = stats.get('last_scan')
     if not last_scan:
